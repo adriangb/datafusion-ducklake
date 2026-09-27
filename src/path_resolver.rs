@@ -85,12 +85,15 @@ fn validate_path(path: &str) -> Result<()> {
 /// Parses a data path into an ObjectStoreUrl and key path
 ///
 /// Supports three formats:
-/// - S3 URLs: `s3://bucket/prefix/path`
+/// - Object store URLs: `scheme://bucket/prefix/path`, for example `s3://`,
+///   `gs://`, `gcs://`, `az://`, `abfss://` or `memory://`. The object store
+///   for `scheme://bucket/` must be registered in the DataFusion
+///   `RuntimeEnv`.
 /// - File URLs: `file:///absolute/path`
 /// - Local paths: `/absolute/path` or `relative/path`
 ///
 /// # Arguments
-/// * `data_path` - The path to parse (may be S3, file://, or local path)
+/// * `data_path` - The path to parse (object store URL, file://, or local path)
 ///
 /// # Returns
 /// A tuple of (ObjectStoreUrl, key_path) where:
@@ -100,7 +103,7 @@ fn validate_path(path: &str) -> Result<()> {
 /// # Errors
 /// Returns error if:
 /// - URL parsing fails
-/// - S3 URL is missing bucket name
+/// - An object store URL is missing the bucket name
 /// - Local path cannot be canonicalized (doesn't exist or permission denied)
 /// - Path contains null bytes or path traversal sequences
 ///
@@ -120,26 +123,45 @@ pub fn parse_object_store_url(data_path: &str) -> Result<(ObjectStoreUrl, String
 
     // Use case-insensitive scheme matching per RFC 3986 (#61)
     let lower = data_path.to_ascii_lowercase();
-    if lower.starts_with("s3://") {
-        parse_s3_url(data_path)
-    } else if lower.starts_with("file://") {
+    if lower.starts_with("file://") {
         parse_file_url(data_path)
+    } else if has_url_scheme(data_path) {
+        parse_bucket_url(data_path)
     } else {
         parse_local_path(data_path)
     }
 }
 
-/// Parse an S3 URL into ObjectStoreUrl and key path
-fn parse_s3_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
+/// Whether `data_path` starts with `scheme://`. A scheme has at least two
+/// characters (RFC 3986 syntax), so a Windows path such as `C://data` is not
+/// taken for a URL.
+fn has_url_scheme(data_path: &str) -> bool {
+    let Some((scheme, _)) = data_path.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    scheme.len() > 1
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Parse an object store URL (`scheme://bucket/key`) into ObjectStoreUrl and key path
+fn parse_bucket_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
     let url = url::Url::parse(data_path).map_err(|e| {
-        DuckLakeError::InvalidConfig(format!("Failed to parse S3 URL '{}': {}", data_path, e))
+        DuckLakeError::InvalidConfig(format!("Failed to parse URL '{}': {}", data_path, e))
     })?;
 
-    let bucket = url.host_str().ok_or_else(|| {
-        DuckLakeError::InvalidConfig(format!("S3 URL missing bucket: {}", data_path))
-    })?;
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "URL missing bucket: {}",
+            data_path
+        )));
+    }
 
-    let object_store_url = ObjectStoreUrl::parse(format!("s3://{}/", bucket)).map_err(|e| {
+    // The store is keyed by everything before the path: scheme, user info
+    // (`abfss://container@account...`), host and port.
+    let authority = &url[..url::Position::BeforePath];
+    let object_store_url = ObjectStoreUrl::parse(format!("{authority}/")).map_err(|e| {
         DuckLakeError::InvalidConfig(format!("Failed to create ObjectStoreUrl: {}", e))
     })?;
 
@@ -391,6 +413,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_other_object_store_urls() {
+        for (data_path, store, key) in [
+            ("gs://bucket/prefix/data/", "gs://bucket/", "/prefix/data/"),
+            ("gcs://bucket/data", "gcs://bucket/", "/data"),
+            ("az://container/data/", "az://container/", "/data/"),
+            (
+                "abfss://fs@account.dfs.core.windows.net/data/",
+                "abfss://fs@account.dfs.core.windows.net/",
+                "/data/",
+            ),
+            ("memory://bucket/", "memory://bucket/", "/"),
+            ("GS://bucket/data/", "gs://bucket/", "/data/"),
+        ] {
+            let (url, path) = parse_object_store_url(data_path).unwrap();
+            assert_eq!(url, ObjectStoreUrl::parse(store).unwrap(), "{data_path}");
+            assert_eq!(path, key, "{data_path}");
+        }
+    }
+
+    #[test]
+    fn test_single_letter_scheme_is_a_local_path() {
+        assert!(!has_url_scheme("C://data"));
+        assert!(!has_url_scheme("/tmp/data"));
+        assert!(!has_url_scheme("relative/data"));
+        assert!(has_url_scheme("gs://b/"));
+        assert!(!has_url_scheme("1s://b/"));
+    }
+
+    #[test]
     fn test_parse_s3_url_missing_bucket() {
         let result = parse_object_store_url("s3:///path");
         assert!(result.is_err());
@@ -398,7 +449,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("S3 URL missing bucket")
+                .contains("URL missing bucket")
         );
     }
 

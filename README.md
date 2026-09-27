@@ -335,7 +335,8 @@ A few highlights worth knowing up front:
 
 - Reads and writes work on DuckDB, SQLite, PostgreSQL, and MySQL. PostgreSQL supports the standard
   single-catalog layout, recommended by default, and an experimental multi-catalog layout.
-- Object stores: local filesystem and S3-compatible (S3, MinIO).
+- Object stores: local filesystem, S3-compatible (S3, MinIO), and any other `object_store`
+  backend registered in the `RuntimeEnv` under the `data_path` scheme (`gs://`, `az://`, ...).
 - Snapshots can be selected through `DuckLakeCatalog` (by id or timestamp) or per query with
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
 - Table partitioning: read + file pruning on all backends; partitioned writes on every
