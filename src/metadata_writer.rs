@@ -1557,7 +1557,9 @@ pub struct CommitIds {
 /// Stable identity of one visible inlined row selected for deletion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InlinedRowRef {
-    /// Physical `ducklake_inlined_data_*` table registered for the table.
+    /// Physical `ducklake_inlined_data_*` table registered for the table. On
+    /// multicatalog PostgreSQL, whose inlined rows share one table, the same
+    /// name form identifies the table id and schema version of the rows.
     pub table_name: String,
     /// Stable DuckLake row id within that table.
     pub row_id: i64,
