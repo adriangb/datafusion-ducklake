@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A `data_path` may use any object store URL scheme, for example `gs://`, `gcs://`, `az://` or
+  `abfss://`, not only `s3://`. Its store is found by `scheme://authority/` in the DataFusion
+  `RuntimeEnv`. Before, such a path was taken for a local path.
 - Snapshot SQL listings expose schema version, structured changes, raw tokens,
   and commit metadata (#318).
 - `StatsSqlDialect::cte_materialization` lets a dialect declare the statistics
