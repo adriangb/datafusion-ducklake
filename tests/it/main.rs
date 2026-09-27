@@ -37,6 +37,7 @@ mod hybrid_asyncdb;
 mod information_schema_test;
 mod inline_delete_postgres_tests;
 mod inline_delete_sqlite_tests;
+mod inline_shared_postgres_tests;
 mod inlined_data_backends_tests;
 mod inlined_data_sqlite_tests;
 mod inlined_delete_fixture;

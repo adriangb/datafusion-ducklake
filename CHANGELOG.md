@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they replace. DuckDB and MySQL keep refusing an `UPDATE` of a table with
   inlined rows (`MetadataWriter::supports_inline_update`).
 - SQL `DELETE`/`UPDATE` on SQLite and multicatalog PostgreSQL store up to `data_inlining_row_limit`
-  removed Parquet rows in `ducklake_inlined_delete_<table_id>`, writing no delete file.
+  removed Parquet rows as inlined deletions, writing no delete file.
 - `DuckLakeTable::flush_inlined_deletes` moves inlined Parquet-row deletes into delete files;
   `MetadataWriter::tables_with_inlined_file_deletes` lists the tables that have some.
 - `datafusion_ducklake::is_conflict` and `DuckLakeError::is_conflict` recognize
@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: multicatalog PostgreSQL keeps all inlined rows and deletions in two shared tables,
+  not one relation per table and schema version, so inline writes run no DDL. Opening a store
+  migrates it; do not write to a migrated store with an earlier version.
 - **BREAKING**: `SnapshotMetadata` adds `schema_version: Option<i64>`; update
   struct literals (#318).
 - **BREAKING**: `RenderedColumnFilter` adds

@@ -939,7 +939,9 @@ pub struct DuckLakeNameMapping {
 /// One physical inlined-data table's visible rows with their stable row ids.
 #[derive(Debug, Clone)]
 pub struct DuckLakeInlinedData {
-    /// Catalog physical table that owns the rows.
+    /// Catalog physical table that owns the rows. On multicatalog PostgreSQL,
+    /// whose inlined rows share one table, a name of the same form that
+    /// identifies their table id and schema version.
     pub table_name: String,
     /// Stable DuckLake row ids, aligned with `batch` rows.
     pub row_ids: Vec<i64>,

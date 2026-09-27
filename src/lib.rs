@@ -108,6 +108,8 @@ pub mod metadata_provider_sqlite;
 pub mod compaction;
 #[cfg(feature = "write")]
 pub mod delete_exec;
+#[cfg(feature = "multicatalog-postgres")]
+pub(crate) mod inline_store_postgres;
 #[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]

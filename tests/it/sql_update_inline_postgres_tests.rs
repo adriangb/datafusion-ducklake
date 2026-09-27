@@ -6,7 +6,7 @@
 //! inlined data table; old versions held in Parquet get a positional delete.
 //! New versions are stored inline when the writer's `data_inlining_row_limit`
 //! admits them, otherwise in a Parquet file, and keep the row id of the version
-//! they replace. These tests read the physical inlined tables directly to check
+//! they replace. These tests read the shared inlined tables directly to check
 //! that, and read the table through time travel and after a flush.
 //! Docker-gated (testcontainers Postgres).
 
@@ -178,34 +178,64 @@ impl Lake {
         out
     }
 
-    /// Every physical inlined row version:
+    /// Every stored inlined row version of `public.t`:
     /// `(row_id, begin_snapshot, end_snapshot, id, val)`, ordered.
     pub(crate) async fn inline_versions(&self) -> Vec<(i64, i64, Option<i64>, i32, Option<i32>)> {
-        let tables: Vec<String> =
-            sqlx::query_scalar("SELECT table_name FROM ducklake_inlined_data_tables")
-                .fetch_all(&self.pool)
+        let table_id = self.table_id("t").await;
+        let column = |name: &'static str| {
+            let pool = self.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .bind(name)
+                .fetch_one(&pool)
                 .await
-                .unwrap();
-        let mut out = Vec::new();
-        for table in tables {
-            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT row_id, begin_snapshot, end_snapshot, id, val FROM \"{table}\""
-            )))
-            .fetch_all(&self.pool)
-            .await
-            .unwrap();
-            for row in rows {
-                out.push((
-                    row.get::<i64, _>(0),
-                    row.get::<i64, _>(1),
-                    row.get::<Option<i64>, _>(2),
-                    row.get::<i32, _>(3),
-                    row.get::<Option<i32>, _>(4),
-                ));
+                .unwrap()
             }
+        };
+        let (id_column, val_column) = (column("id").await, column("val").await);
+        let rows = sqlx::query(
+            "SELECT row_id, begin_snapshot, end_snapshot, data FROM ducklake_inlined_row
+             WHERE table_id = $1",
+        )
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        for row in rows {
+            let cells = decode_inline_cells(&row.get::<Vec<u8>, _>(3));
+            let int = |column: i64| {
+                cells
+                    .get(&column)
+                    .cloned()
+                    .flatten()
+                    .map(|text| text.parse::<i32>().unwrap())
+            };
+            out.push((
+                row.get::<i64, _>(0),
+                row.get::<i64, _>(1),
+                row.get::<Option<i64>, _>(2),
+                int(id_column).unwrap(),
+                int(val_column),
+            ));
         }
         out.sort();
         out
+    }
+
+    /// The live table id of `public.<name>`.
+    pub(crate) async fn table_id(&self, name: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT table_id FROM ducklake_table WHERE table_name = $1 AND end_snapshot IS NULL",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
     }
 
     /// `(live data files, live delete files)`.
@@ -225,28 +255,15 @@ impl Lake {
         (data, deletes)
     }
 
-    /// Every row of `public.t`'s `ducklake_inlined_delete_<table_id>`:
-    /// `(file_id, row_id, begin_snapshot)`, ordered. Empty when the table
-    /// does not exist.
+    /// Every inlined deletion of a Parquet row of `public.t`:
+    /// `(file_id, row_id, begin_snapshot)`, ordered.
     pub(crate) async fn inline_file_deletes(&self) -> Vec<(i64, i64, i64)> {
-        let table_id: i64 = sqlx::query_scalar(
-            "SELECT table_id FROM ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+        let table_id = self.table_id("t").await;
+        sqlx::query(
+            "SELECT file_id, row_id, begin_snapshot FROM ducklake_inlined_file_delete
+             WHERE table_id = $1 ORDER BY 1, 2, 3",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap();
-        let table = format!("ducklake_inlined_delete_{table_id}");
-        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(&table)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap();
-        if !exists {
-            return Vec::new();
-        }
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT file_id, row_id, begin_snapshot FROM \"{table}\" ORDER BY 1, 2, 3"
-        )))
+        .bind(table_id)
         .fetch_all(&self.pool)
         .await
         .unwrap()
@@ -344,6 +361,35 @@ impl Lake {
             .expect("there were inlined rows to flush")
             .snapshot_id
     }
+}
+
+/// Decodes the `data` cell of a `ducklake_inlined_row` row into
+/// `column_id -> value` (NULL as `None`; strings and text as UTF-8). Written
+/// from the format's documentation, independently of the library's decoder.
+pub(crate) fn decode_inline_cells(data: &[u8]) -> std::collections::HashMap<i64, Option<String>> {
+    assert_eq!(data[0], 1, "format version");
+    let count = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+    let mut at = 5;
+    let mut cells = std::collections::HashMap::new();
+    for _ in 0..count {
+        let column_id = i64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let tag = data[at + 8];
+        at += 9;
+        let value = match tag {
+            0 => None,
+            1 | 2 => {
+                let len = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+                at += 4;
+                let value = String::from_utf8(data[at..at + len].to_vec()).unwrap();
+                at += len;
+                Some(value)
+            },
+            other => panic!("unknown tag {other}"),
+        };
+        cells.insert(column_id, value);
+    }
+    assert_eq!(at, data.len(), "trailing bytes");
+    cells
 }
 
 pub(crate) fn some(rows: &[(i32, i32)]) -> Vec<(i32, Option<i32>)> {

@@ -1,6 +1,6 @@
 //! Deletion inlining on the multicatalog PostgreSQL backend: a SQL `DELETE`
 //! or `UPDATE` that removes at most `data_inlining_row_limit` rows held in
-//! Parquet files records them in `ducklake_inlined_delete_<table_id>` instead
+//! Parquet files records them in the shared `ducklake_inlined_file_delete` instead
 //! of writing a delete file, and `DuckLakeTable::flush_inlined_deletes` later
 //! materializes them into delete files. These tests check the catalog tables
 //! and the object store directly, and read every snapshot back through time
