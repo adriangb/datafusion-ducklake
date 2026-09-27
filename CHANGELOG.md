@@ -11,11 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - SQL `UPDATE` rewrites visible inlined rows on SQLite and multicatalog
   PostgreSQL: inlined old versions are ended in their inlined data table,
-  Parquet old versions get a positional delete, and the new versions are
+  Parquet old versions are deleted as by a SQL `DELETE`, and the new versions are
   stored inline when they fit the writer's `data_inlining_row_limit` (else in
   Parquet), all in one snapshot. New versions keep the row id of the version
   they replace. DuckDB and MySQL keep refusing an `UPDATE` of a table with
   inlined rows (`MetadataWriter::supports_inline_update`).
+- SQL `DELETE`/`UPDATE` on SQLite and multicatalog PostgreSQL store up to `data_inlining_row_limit`
+  removed Parquet rows in `ducklake_inlined_delete_<table_id>`, writing no delete file.
+- `DuckLakeTable::flush_inlined_deletes` moves inlined Parquet-row deletes into delete files;
+  `MetadataWriter::tables_with_inlined_file_deletes` lists the tables that have some.
 - `datafusion_ducklake::is_conflict` and `DuckLakeError::is_conflict` recognize
   an optimistic-concurrency abort (`DuckLakeError::Conflict`) through
   DataFusion's error wrappers, so a caller can retry it.
@@ -87,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Time travel applies the per-row `_ducklake_internal_snapshot_id` of a delete file, such as one
+  written by DuckDB's `ducklake_flush_inlined_data`.
+- A `DELETE` that mixes delete files and inlined-row deletes aborts when an inlined Parquet-row
+  delete landed on one of its data files after its snapshot.
 - Multi-table commits on SQLite and multicatalog PostgreSQL abort when an
   inlined delete landed on a positional-delete target file after the base
   snapshot, as the single-table delete commits already do.

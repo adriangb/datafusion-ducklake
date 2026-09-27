@@ -25,7 +25,7 @@ use super::sql_update_inline_postgres_tests::{CAT, Lake, batch, some};
 
 impl Lake {
     /// A writable handle on `public.t`, pinned at the current head.
-    async fn table_handle(&self, limit: usize) -> (DuckLakeTable, SessionState) {
+    pub(crate) async fn table_handle(&self, limit: usize) -> (DuckLakeTable, SessionState) {
         let ctx = self.ctx(limit).await;
         let provider = ctx
             .catalog(CAT)
@@ -630,4 +630,289 @@ async fn merge_vs_schema_change_commits_correctly() {
         })
         .collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+}
+
+// Deletion inlining: DML that records inlined deletions of Parquet rows vs
+// the flush of those deletions and vs compaction, in both commit orders.
+
+/// One Parquet file (rows 1..=6) with one inlined deletion (row 6), so a
+/// flush of inlined deletions has work.
+async fn parquet_file_with_an_inlined_delete(lake: &Lake) {
+    lake.seed(
+        batch(vec![1, 2, 3, 4, 5, 6], vec![10, 20, 30, 40, 50, 60]),
+        0,
+    )
+    .await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 6"), 10)
+        .await;
+    assert_eq!(lake.live_files().await, (1, 0));
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn inlined_delete_update_vs_flush_of_deletes() {
+    let lake = Lake::new().await;
+    parquet_file_with_an_inlined_delete(&lake).await;
+
+    // UPDATE planned, the flush of deletions commits first: the UPDATE aborts
+    // (the file's live delete file changed).
+    let update = lake
+        .plan(
+            &format!("UPDATE {CAT}.public.t SET val = 0 WHERE id = 1"),
+            10,
+        )
+        .await;
+    assert_eq!(lake.flush_deletes().await.rows_flushed, 1);
+    let head = lake.head().await;
+    let error = update.collect().await.expect_err("stale UPDATE must abort");
+    assert!(is_conflict(&error), "{error}");
+    assert_eq!(lake.head().await, head, "an abort commits nothing");
+    assert!(lake.inline_file_deletes().await.is_empty());
+    let expected = some(&[(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
+    assert_eq!(lake.rows(None).await, expected);
+
+    // The flush reads, an UPDATE and a DELETE commit first: the flush aborts.
+    lake.exec(
+        &format!("UPDATE {CAT}.public.t SET val = 0 WHERE id = 1"),
+        10,
+    )
+    .await;
+    let (stale, state) = lake.table_handle(0).await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 2"), 10)
+        .await;
+    let head = lake.head().await;
+    let error = stale
+        .flush_inlined_deletes(&state)
+        .await
+        .expect_err("stale flush must abort");
+    assert!(error.is_conflict(), "{error}");
+    assert_eq!(lake.head().await, head);
+    let expected = some(&[(1, 0), (3, 30), (4, 40), (5, 50)]);
+    assert_eq!(lake.rows(None).await, expected);
+    assert_eq!(lake.count(None).await, 4);
+    assert_eq!(lake.flush_deletes().await.rows_flushed, 2);
+    assert_eq!(lake.rows(None).await, expected);
+    assert_eq!(lake.count(None).await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn inlined_delete_vs_rewrite_data_files() {
+    let lake = Lake::new().await;
+    parquet_file_with_an_inlined_delete(&lake).await;
+
+    // The rewrite reads, an inlined DELETE commits first: the rewrite aborts.
+    let (stale, state) = lake.table_handle(0).await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 5"), 10)
+        .await;
+    let head = lake.head().await;
+    let error = stale
+        .rewrite_data_files(&state, rewrite_all())
+        .await
+        .expect_err("stale rewrite must abort");
+    assert!(error.is_conflict(), "{error}");
+    assert_eq!(lake.head().await, head);
+    let expected = some(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
+    assert_eq!(lake.rows(None).await, expected);
+
+    // DELETE planned, the rewrite commits first: the DELETE aborts.
+    let delete = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 4"), 10)
+        .await;
+    let (table, state) = lake.table_handle(0).await;
+    assert!(
+        table
+            .rewrite_data_files(&state, rewrite_all())
+            .await
+            .unwrap()
+            .did_work()
+    );
+    let head = lake.head().await;
+    let error = delete.collect().await.expect_err("stale DELETE must abort");
+    assert!(is_conflict(&error), "{error}");
+    assert_eq!(lake.head().await, head);
+    assert_eq!(lake.rows(None).await, expected);
+    assert_eq!(lake.count(None).await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn inlined_delete_vs_merge_adjacent_files() {
+    let lake = Lake::new().await;
+    two_parquet_files(&lake).await;
+
+    // The merge reads, an inlined DELETE commits first: the merge aborts.
+    let (stale, state) = lake.table_handle(0).await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 1"), 10)
+        .await;
+    let head = lake.head().await;
+    let error = stale
+        .merge_adjacent_files(&state, MergeOptions::default())
+        .await
+        .expect_err("stale merge must abort");
+    assert!(error.is_conflict(), "{error}");
+    assert_eq!(lake.head().await, head);
+    let expected = some(&[(2, 20), (3, 30), (4, 40)]);
+    assert_eq!(lake.rows(None).await, expected);
+    // A fresh merge skips the file with an inlined deletion.
+    assert!(!lake.merge().await.did_work());
+
+    // After a flush of the deletions the file has a delete file, which merge
+    // also skips. DELETE planned, then a rewrite and a merge commit first. A
+    // DELETE lists its files when it runs, and its pinned snapshot sees the
+    // merged file (visible from its sources' first snapshot), so it commits
+    // correctly.
+    lake.flush_deletes().await;
+    let delete = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 3"), 10)
+        .await;
+    let (table, state) = lake.table_handle(0).await;
+    assert!(
+        table
+            .rewrite_data_files(&state, rewrite_all())
+            .await
+            .unwrap()
+            .did_work()
+    );
+    assert!(lake.merge().await.did_work());
+    delete.collect().await.unwrap();
+    assert_eq!(lake.rows(None).await, some(&[(2, 20), (4, 40)]));
+    assert_eq!(lake.count(None).await, 2);
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
+
+    // UPDATE planned (it lists its files at plan time), merge commits first:
+    // the UPDATE aborts.
+    let lake = Lake::new().await;
+    two_parquet_files(&lake).await;
+    let update = lake
+        .plan(
+            &format!("UPDATE {CAT}.public.t SET val = 0 WHERE id = 3"),
+            10,
+        )
+        .await;
+    assert!(lake.merge().await.did_work());
+    let head = lake.head().await;
+    let error = update.collect().await.expect_err("stale UPDATE must abort");
+    assert!(is_conflict(&error), "{error}");
+    assert_eq!(lake.head().await, head);
+    assert_eq!(
+        lake.rows(None).await,
+        some(&[(1, 10), (2, 20), (3, 30), (4, 40)])
+    );
+}
+
+/// Two DML statements that inline deletions of rows in one file, planned at
+/// the same snapshot: the second to commit aborts, even for the same row. On
+/// different files both commit.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn concurrent_inlined_deletes() {
+    // The same row, and another row of the same file.
+    for sql in [
+        format!("DELETE FROM {CAT}.public.t WHERE id = 1"),
+        format!("UPDATE {CAT}.public.t SET val = 0 WHERE id = 2"),
+    ] {
+        let lake = Lake::new().await;
+        two_parquet_files(&lake).await;
+        let first = lake
+            .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 1"), 10)
+            .await;
+        let second = lake.plan(&sql, 10).await;
+        first.collect().await.unwrap();
+        let head = lake.head().await;
+        let error = second.collect().await.expect_err("second must abort");
+        assert!(is_conflict(&error), "{sql}: {error}");
+        assert_eq!(lake.head().await, head);
+        assert_eq!(lake.rows(None).await, some(&[(2, 20), (3, 30), (4, 40)]));
+    }
+
+    // Different files commute.
+    let lake = Lake::new().await;
+    two_parquet_files(&lake).await;
+    let first = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 2"), 10)
+        .await;
+    let second = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 3"), 10)
+        .await;
+    first.collect().await.unwrap();
+    second.collect().await.unwrap();
+    assert_eq!(lake.rows(None).await, some(&[(1, 10), (4, 40)]));
+    assert_eq!(lake.count(None).await, 2);
+}
+
+/// A DELETE that writes a delete file, planned before an inlined deletion of
+/// the same file commits, aborts rather than lose the inlined one; in the
+/// other order the inlined deletion aborts.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn delete_file_vs_inlined_delete() {
+    let lake = Lake::new().await;
+    lake.seed(batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]), 0)
+        .await;
+
+    let big = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id <= 2"), 1)
+        .await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 3"), 1)
+        .await;
+    let head = lake.head().await;
+    let error = big.collect().await.expect_err("stale DELETE must abort");
+    assert!(is_conflict(&error), "{error}");
+    assert_eq!(lake.head().await, head);
+
+    let small = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 4"), 1)
+        .await;
+    lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id <= 2"), 1)
+        .await;
+    let head = lake.head().await;
+    let error = small.collect().await.expect_err("stale DELETE must abort");
+    assert!(is_conflict(&error), "{error}");
+    assert_eq!(lake.head().await, head);
+    assert_eq!(lake.rows(None).await, some(&[(4, 40)]));
+    assert_eq!(lake.count(None).await, 1);
+}
+
+/// A DELETE lists its files when it runs. After a flush of inlined deletions
+/// its pinned snapshot sees the flushed delete file filtered to that
+/// snapshot: when that is all the file holds, the DELETE commits correctly;
+/// when the file also holds a later deletion, the DELETE aborts (in both the
+/// inlined and the delete-file form) rather than bring the row back.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn stale_delete_vs_flush_of_deletes() {
+    let lake = Lake::new().await;
+    parquet_file_with_an_inlined_delete(&lake).await;
+
+    let delete = lake
+        .plan(&format!("DELETE FROM {CAT}.public.t WHERE id = 1"), 10)
+        .await;
+    lake.flush_deletes().await;
+    delete.collect().await.unwrap();
+    assert_eq!(
+        lake.rows(None).await,
+        some(&[(2, 20), (3, 30), (4, 40), (5, 50)])
+    );
+    assert_eq!(lake.count(None).await, 4);
+
+    for (sql, limit) in [
+        (format!("DELETE FROM {CAT}.public.t WHERE id >= 4"), 10),
+        (format!("DELETE FROM {CAT}.public.t WHERE id >= 4"), 1),
+    ] {
+        let delete = lake.plan(&sql, limit).await;
+        lake.exec(&format!("DELETE FROM {CAT}.public.t WHERE id = 5"), 10)
+            .await;
+        lake.flush_deletes().await;
+        let head = lake.head().await;
+        let error = delete.collect().await.expect_err("stale DELETE must abort");
+        assert!(is_conflict(&error), "limit {limit}: {error}");
+        assert_eq!(lake.head().await, head);
+        assert_eq!(lake.rows(None).await, some(&[(2, 20), (3, 30), (4, 40)]));
+        assert_eq!(lake.count(None).await, 3);
+        // Put row 5 back for the next round.
+        lake.exec(&format!("INSERT INTO {CAT}.public.t VALUES (5, 50)"), 0)
+            .await;
+    }
 }
