@@ -348,7 +348,9 @@ A few highlights worth knowing up front:
   `COUNT(*)` on every backend. Writing small batches inline is opt-in via the
   `data_inlining_row_limit` setting. `UPDATE` rewrites inlined rows on SQLite and multicatalog
   PostgreSQL and refuses them on DuckDB and MySQL; row-lineage scans still refuse a table with
-  visible inlined rows — see COMPATIBILITY.md.
+  visible inlined rows. On SQLite and multicatalog PostgreSQL a small `DELETE`/`UPDATE` of
+  Parquet rows is stored as inlined deletes (no delete file) until
+  `DuckLakeTable::flush_inlined_deletes` — see COMPATIBILITY.md.
 - Schema evolution: recursive `list`/`struct`/`map` columns, literal column defaults, and
   per-file `map_by_name` name mappings are honoured across scans, writes, and change feeds.
 - Read-only DuckLake views are exposed across metadata backends.
