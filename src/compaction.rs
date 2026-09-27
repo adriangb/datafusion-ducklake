@@ -958,6 +958,7 @@ impl DuckLakeTable {
                         tf,
                         source_embeds_origins,
                         inlined_deletes.get(&tf.data_file_id),
+                        None,
                     )
                     .await?;
                 leaves.push(Arc::new(CompactionSourceExec::new(

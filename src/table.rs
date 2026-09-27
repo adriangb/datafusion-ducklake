@@ -3959,7 +3959,31 @@ impl DuckLakeTable {
         table_file: &DuckLakeTableFile,
         inlined_positions: Option<&HashSet<i64>>,
     ) -> DataFusionResult<UpdateSourceScan> {
-        self.build_update_scan_with_snapshot(state, table_file, false, inlined_positions)
+        self.build_update_scan_with_snapshot(state, table_file, false, inlined_positions, None)
+            .await
+    }
+
+    /// [`Self::build_update_scan`] for an `UPDATE ... WHERE predicate`: the
+    /// predicate is also handed to the Parquet reader, so row groups and pages
+    /// whose statistics rule it out are never decoded. Without it, updating one
+    /// row reads every row of every candidate file.
+    ///
+    /// This is the same pushdown [`Self::resolve_positions`] does for `DELETE`,
+    /// under the same [`Self::predicate_is_prunable`] guard, and safe for the
+    /// same reason: positions come from the reader's physical-position column
+    /// (derived from row-group offsets), so skipping row groups never shifts
+    /// them, and a skipped row could not have matched. The scan still yields
+    /// candidate rows only; [`Self::apply_update_to_batches`] re-applies the
+    /// predicate to choose the rows it rewrites.
+    #[cfg(feature = "write")]
+    pub(crate) async fn build_update_scan_filtered(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> DataFusionResult<UpdateSourceScan> {
+        self.build_update_scan_with_snapshot(state, table_file, false, inlined_positions, predicate)
             .await
     }
 
@@ -3983,6 +4007,7 @@ impl DuckLakeTable {
         table_file: &DuckLakeTableFile,
         want_snapshot_id: bool,
         inlined_positions: Option<&HashSet<i64>>,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<UpdateSourceScan> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
@@ -4057,8 +4082,18 @@ impl DuckLakeTable {
         proj.push(pos_table_idx);
         let pos_index = proj.len() - 1;
 
+        // Prune row groups and pages with the UPDATE's predicate when it is safe
+        // to (see `build_update_scan_filtered`). Its column indices are the
+        // table's logical order, which the first `physical_len` fields of the
+        // read schema follow.
+        let mut source = self.create_parquet_source(state, table_schema)?;
+        if let Some(predicate) = predicate
+            && self.predicate_is_prunable(predicate, &file_cfg)
+        {
+            source = source.with_predicate(Arc::clone(predicate));
+        }
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
-            self.scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
+            self.scan_config_builder(Arc::new(source))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
                 ]))
@@ -4854,8 +4889,13 @@ impl TableProvider for DuckLakeTable {
         let mut scans = Vec::with_capacity(table_files.len());
         for tf in &table_files {
             scans.push(
-                self.build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
-                    .await?,
+                self.build_update_scan_filtered(
+                    state,
+                    tf,
+                    inlined_deletes.get(&tf.data_file_id),
+                    predicate.as_ref(),
+                )
+                .await?,
             );
         }
 

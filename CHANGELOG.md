@@ -74,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitted statement is the previous one with each conversion replaced by a
   reference to itself.
 
+- A keyed `UPDATE` passes its `WHERE` predicate to each source file's Parquet
+  reader, as `DELETE` already does, under the same `predicate_is_prunable`
+  guard. Row groups and pages whose statistics rule the predicate out are no
+  longer decoded, so updating one row reads one row group instead of every row
+  of every candidate file.
+
 ### Fixed
 
 - A promoted file keeps the column statistics it is handed and the table roll-up is rebuilt

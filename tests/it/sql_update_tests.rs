@@ -1572,3 +1572,102 @@ async fn update_partitions_rewritten_rows_when_spec_was_set_after_data() {
         .collect();
     assert_eq!(pairs, vec![(1, 11), (2, 20), (3, 31)]);
 }
+
+// ---------------------------------------------------------------------------
+// Row-group pruning in the UPDATE source scan
+// ---------------------------------------------------------------------------
+
+/// Seed `t(id, val)` as ONE data file of `n` rows written in `row_group`-row
+/// groups, with `val = id * 10`.
+async fn seed_row_groups(temp_dir: &TempDir, n: i32, row_group: usize) {
+    let writer = Arc::new(make_writer(temp_dir).await);
+    let batch = RecordBatch::try_new(
+        table_schema(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..n)),
+            Arc::new(Int32Array::from_iter_values((0..n).map(|i| i * 10))),
+        ],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_max_row_group_rows(row_group)
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+}
+
+/// A keyed UPDATE now hands its predicate to the Parquet reader, which skips
+/// row groups that cannot match. Positions must still name the right physical
+/// rows: this drives updates into the first, a middle, and the last row group
+/// of a file that already carries deletes in skipped and matched groups, and
+/// checks values, deleted rows, and rowid lineage against an oracle computed
+/// without any position math.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_update_with_row_group_pruning_keeps_positions() {
+    const N: i32 = 40;
+    let tmp = TempDir::new().unwrap();
+    seed_row_groups(&tmp, N, 4).await;
+
+    let ctx = writable_ctx(&tmp).await;
+    let deleted = [1, 13, 14, 23, 37];
+    let n = run_dml_count(
+        &ctx,
+        "DELETE FROM ducklake.main.t WHERE id IN (1, 13, 14, 23, 37)",
+    )
+    .await;
+    assert_eq!(n, deleted.len() as u64);
+
+    let mut expected: Vec<(i32, i32)> = (0..N)
+        .filter(|i| !deleted.contains(i))
+        .map(|i| (i, i * 10))
+        .collect();
+    // (row group 0), (row group 5 beside a deleted row), (last row group), a miss.
+    for (sql, ids, val, count) in [
+        (
+            "UPDATE ducklake.main.t SET val = -1 WHERE id = 2",
+            vec![2],
+            -1,
+            1,
+        ),
+        (
+            "UPDATE ducklake.main.t SET val = -2 WHERE id IN (22, 21)",
+            vec![21, 22],
+            -2,
+            2,
+        ),
+        (
+            "UPDATE ducklake.main.t SET val = val + 1 WHERE id >= 38",
+            vec![38, 39],
+            0,
+            2,
+        ),
+        (
+            "UPDATE ducklake.main.t SET val = 0 WHERE id = 13",
+            vec![],
+            0,
+            0,
+        ),
+    ] {
+        // A fresh session per statement: a catalog is pinned to its snapshot.
+        let ctx = writable_ctx(&tmp).await;
+        assert_eq!(run_dml_count(&ctx, sql).await, count, "{sql}");
+        for row in expected.iter_mut().filter(|(id, _)| ids.contains(id)) {
+            row.1 = if sql.contains("val + 1") {
+                row.1 + 1
+            } else {
+                val
+            };
+        }
+    }
+
+    assert_eq!(
+        read_pairs(&tmp).await,
+        expected,
+        "values after pruned updates"
+    );
+    // Seeded in id order from row_id_start 0, so every row keeps rowid == id.
+    for (rowid, id, _) in read_rowid_rows(&tmp).await {
+        assert_eq!(rowid, i64::from(id), "rowid lineage for id {id}");
+    }
+}

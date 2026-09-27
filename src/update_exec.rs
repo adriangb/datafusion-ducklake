@@ -339,4 +339,130 @@ mod tests {
         assert_eq!(schema.field(0).name(), "count");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
     }
+
+    /// A keyed `UPDATE` hands its predicate to each source file's reader, so a
+    /// multi-row-group file decodes only the row groups that can match.
+    #[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+    mod pruning {
+        use std::sync::Arc;
+
+        use arrow::array::{Float64Array, Int32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::{collect, displayable};
+        use datafusion::prelude::SessionContext;
+        use object_store::local::LocalFileSystem;
+
+        use super::super::DuckLakeUpdateExec;
+        use crate::metadata_writer::MetadataWriter;
+        use crate::{
+            DuckLakeCatalog, DuckLakeTableWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+        };
+
+        const ROWS: i32 = 40;
+        const ROW_GROUP: usize = 4;
+
+        /// One data file of `ROWS` rows `(id, score)` in `ROW_GROUP`-row groups.
+        async fn seed(dir: &tempfile::TempDir) -> String {
+            let conn = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
+            let data = dir.path().join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            let writer = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
+            writer.set_data_path(data.to_str().unwrap()).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("score", DataType::Float64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..ROWS)),
+                    Arc::new(Float64Array::from_iter_values((0..ROWS).map(f64::from))),
+                ],
+            )
+            .unwrap();
+            DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new()))
+                .unwrap()
+                .with_max_row_group_rows(ROW_GROUP)
+                .write_table("main", "t", &[batch])
+                .await
+                .unwrap();
+            conn
+        }
+
+        /// Plan `sql` (an UPDATE) and return, per source file, its scan's
+        /// display and the number of rows the scan yields.
+        async fn source_scans(conn: &str, sql: &str) -> Vec<(String, usize)> {
+            let provider = SqliteMetadataProvider::new(conn).await.unwrap();
+            let writer = SqliteMetadataWriter::new(conn).await.unwrap();
+            let catalog =
+                DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+            let ctx = SessionContext::new();
+            ctx.register_catalog("ducklake", Arc::new(catalog));
+            let plan = ctx
+                .sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            fn find(
+                plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            ) -> Option<&DuckLakeUpdateExec> {
+                plan.downcast_ref::<DuckLakeUpdateExec>()
+                    .or_else(|| plan.children().into_iter().find_map(find))
+            }
+            let update = find(&plan).unwrap_or_else(|| {
+                panic!(
+                    "no DuckLakeUpdateExec in\n{}",
+                    displayable(plan.as_ref()).indent(true)
+                )
+            });
+            let mut out = Vec::new();
+            for s in &update.scans {
+                let shown = displayable(s.scan.as_ref()).indent(true).to_string();
+                let rows = collect(Arc::clone(&s.scan), ctx.task_ctx())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum();
+                out.push((shown, rows));
+            }
+            out
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn keyed_update_reads_only_matching_row_groups() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let conn = seed(&dir).await;
+            let scans =
+                source_scans(&conn, "UPDATE ducklake.main.t SET score = 0 WHERE id = 22").await;
+            assert_eq!(scans.len(), 1);
+            let (shown, rows) = &scans[0];
+            assert!(
+                shown.contains("predicate="),
+                "predicate not pushed into the reader:\n{shown}"
+            );
+            assert!(
+                *rows <= ROW_GROUP,
+                "scanned {rows} rows of {ROWS}; expected at most one {ROW_GROUP}-row group"
+            );
+        }
+
+        /// The `DELETE` guard applies: a float predicate is not pushed (footer
+        /// bounds exclude NaN), so the whole file is read, as before.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn float_predicate_is_not_pushed() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let conn = seed(&dir).await;
+            let scans =
+                source_scans(&conn, "UPDATE ducklake.main.t SET id = 0 WHERE score = 22").await;
+            let (shown, rows) = &scans[0];
+            assert!(
+                !shown.contains("predicate="),
+                "float predicate was pushed:\n{shown}"
+            );
+            assert_eq!(*rows, ROWS as usize);
+        }
+    }
 }
