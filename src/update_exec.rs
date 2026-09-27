@@ -39,6 +39,12 @@
 //! Other writers refuse an `UPDATE` of a table with visible inlined rows at
 //! plan time.
 //!
+//! On a writer that also supports deletion inlining
+//! ([`MetadataWriter::supports_inlined_file_deletes`]), the old versions held in
+//! Parquet are ended with inlined deletions (`ducklake_inlined_delete_<id>`)
+//! instead of delete files when their number is within the same limit, so a
+//! small UPDATE writes nothing to object storage.
+//!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
 //! collects matched rows into memory before writing; runs in a single DataFusion
 //! output partition.
@@ -80,7 +86,9 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{self, TryStreamExt};
 
 use crate::compaction::sorted_rewrite_batches;
-use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter, WriteMode};
+use crate::metadata_writer::{
+    DeleteFileEntry, InlinedFileDeleteEntry, InlinedRowRef, MetadataWriter, WriteMode,
+};
 use crate::table::{DuckLakeTable, UpdateSourceScan, rewrite_inlined_rows};
 use crate::table_writer::{DuckLakeTableWriter, UpdateVersions};
 
@@ -261,8 +269,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // untouched (only orphan objects, cleaned by maintenance).
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             let mut delete_entries: Vec<DeleteFileEntry> = Vec::new();
+            let mut inlined_file_deletes: Vec<InlinedFileDeleteEntry> = Vec::new();
             let mut total_updated: u64 = 0;
 
+            let mut superseded = Vec::new();
             for scan in &scans {
                 let batches =
                     datafusion::physical_plan::collect(Arc::clone(&scan.scan), context.clone())
@@ -278,13 +288,33 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 }
                 total_updated += out.matched_count as u64;
                 updated_batches.extend(out.updated_batches);
+                superseded.push((scan, out.cumulative_positions, out.new_positions));
+            }
 
+            // End the old Parquet versions: as inlined deletions in the catalog
+            // when their number fits the inlining limit, else with one
+            // cumulative delete file per source file.
+            let parquet_rows = superseded
+                .iter()
+                .map(|(_, _, positions)| positions.len())
+                .sum::<usize>();
+            let inline_file_deletes =
+                inline_update && table_writer.should_inline_file_deletes(parquet_rows);
+            for (scan, cumulative_positions, new_positions) in superseded {
+                if inline_file_deletes {
+                    inlined_file_deletes.push(InlinedFileDeleteEntry {
+                        data_file_id: scan.data_file_id,
+                        expected_prev_delete_file: scan.delete_file_id,
+                        positions: new_positions,
+                    });
+                    continue;
+                }
                 let delete_info = table_writer
                     .write_delete_file(
                         &schema_name,
                         &table_name,
                         &scan.source_path,
-                        &out.cumulative_positions,
+                        &cumulative_positions,
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -348,6 +378,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                             },
                             &delete_entries,
                             &inlined_deletes,
+                            &inlined_file_deletes,
                         )
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -383,7 +414,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .write_batch(&batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
-            if inlined_deletes.is_empty() {
+            if inlined_deletes.is_empty() && inlined_file_deletes.is_empty() {
                 session
                     .finish_with_deletes(&delete_entries)
                     .await
@@ -400,6 +431,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         UpdateVersions::Files(Box::new(session)),
                         &delete_entries,
                         &inlined_deletes,
+                        &inlined_file_deletes,
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;

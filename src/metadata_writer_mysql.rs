@@ -4863,6 +4863,8 @@ mod tests {
             inlined_deletes: Vec::new(),
             inlined_flush: false,
             inlined_row_ids: None,
+            inlined_file_deletes: Vec::new(),
+            inlined_delete_flushes: Vec::new(),
         };
         let committed = writer
             .commit_multi_table(

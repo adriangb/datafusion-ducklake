@@ -225,6 +225,79 @@ impl Lake {
         (data, deletes)
     }
 
+    /// Every row of `public.t`'s `ducklake_inlined_delete_<table_id>`:
+    /// `(file_id, row_id, begin_snapshot)`, ordered. Empty when the table
+    /// does not exist.
+    pub(crate) async fn inline_file_deletes(&self) -> Vec<(i64, i64, i64)> {
+        let table_id: i64 = sqlx::query_scalar(
+            "SELECT table_id FROM ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let table = format!("ducklake_inlined_delete_{table_id}");
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&table)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        if !exists {
+            return Vec::new();
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT file_id, row_id, begin_snapshot FROM \"{table}\" ORDER BY 1, 2, 3"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+    }
+
+    /// Every object under the data directory (relative paths, sorted).
+    pub(crate) fn objects(&self) -> Vec<String> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.push(path.strip_prefix(root).unwrap().display().to_string());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.data, &self.data, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `SELECT COUNT(*)` of `public.t`, at `snapshot` or at the head.
+    pub(crate) async fn count(&self, snapshot: Option<i64>) -> i64 {
+        let provider = self.provider().await;
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => provider.get_current_snapshot().unwrap(),
+        };
+        let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog(CAT, Arc::new(catalog));
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) FROM {CAT}.public.t"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
     /// Read what a flush of `public.t` at the current head would write: the
     /// visible inlined rows and the head they were read at.
     pub(crate) async fn flush_inputs(
@@ -373,7 +446,18 @@ async fn update_parquet_rows_writes_inline_versions() {
         lake.rows(Some(before)).await,
         some(&[(1, 10), (2, 20), (3, 30), (4, 40)])
     );
-    assert_eq!(lake.live_files().await, (1, 1), "no new data file");
+    // No new data file and no delete file: the old versions' ends are
+    // inlined deletions of positions 1 and 3.
+    assert_eq!(
+        lake.live_files().await,
+        (1, 0),
+        "no new data or delete file"
+    );
+    let file_id = lake.inline_file_deletes().await[0].0;
+    assert_eq!(
+        lake.inline_file_deletes().await,
+        vec![(file_id, 1, after), (file_id, 3, after)]
+    );
     // Parquet row ids are row_id_start (0) + position.
     assert_eq!(
         lake.inline_versions().await,
@@ -415,7 +499,8 @@ async fn update_mixed_inlined_and_parquet_rows() {
         lake.rows(Some(before)).await,
         some(&[(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)])
     );
-    assert_eq!(lake.live_files().await, (1, 1));
+    assert_eq!(lake.live_files().await, (1, 0));
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
     let live: Vec<_> = lake
         .inline_versions()
         .await
@@ -462,9 +547,10 @@ async fn repeated_updates_of_the_same_row() {
         "row id 0 kept: {versions:?}"
     );
     assert_eq!(versions.iter().filter(|v| v.2.is_none()).count(), 1);
-    // The Parquet row got one positional delete; later updates only touch
+    // The Parquet row got one inlined deletion; later updates only touch
     // inlined versions.
-    assert_eq!(lake.live_files().await, (1, 1));
+    assert_eq!(lake.live_files().await, (1, 0));
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
 }
 
 /// A DELETE after an UPDATE ends the live new version only.
@@ -586,7 +672,8 @@ async fn update_above_the_inline_limit_writes_parquet() {
     )
     .await;
     assert_eq!(lake.rows(None).await, some(&[(1, 20), (2, 1), (3, 60)]));
-    assert_eq!(lake.live_files().await, (1, 1));
+    assert_eq!(lake.live_files().await, (1, 0));
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
 }
 
 /// Flushing after a mix of inline inserts, updates and deletes writes exactly
@@ -681,7 +768,7 @@ async fn keyed_update_on_a_table_with_row_groups_and_inlined_rows() {
     assert!(rows.contains(&(21, Some(210))));
     assert!(rows.contains(&(23, Some(230))));
 
-    // Only the inlined row matches: no delete file is written.
+    // Only the inlined row matches: nothing new for the Parquet file.
     let n = lake
         .exec(
             &format!("UPDATE {CAT}.public.t SET val = -3 WHERE id = 100"),
@@ -689,7 +776,8 @@ async fn keyed_update_on_a_table_with_row_groups_and_inlined_rows() {
         )
         .await;
     assert_eq!(n, 1);
-    assert_eq!(lake.live_files().await, (1, 1));
+    assert_eq!(lake.live_files().await, (1, 0));
+    assert_eq!(lake.inline_file_deletes().await.len(), 1);
     assert!(lake.rows(None).await.contains(&(100, Some(-3))));
 }
 

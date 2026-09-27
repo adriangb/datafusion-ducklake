@@ -23,9 +23,9 @@ use uuid::Uuid;
 use crate::Result;
 use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter,
-    SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode, WriteResult,
-    validate_delete_entries,
+    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedDeleteFlushEntry,
+    InlinedFileDeleteEntry, InlinedRowRef, MetadataWriter, SnapshotCommitMetadata, StagedTableData,
+    StagedTableWrite, WriteMode, WriteResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
@@ -427,6 +427,8 @@ pub(crate) enum UpdateVersions {
     /// [`DuckLakeTableWriter::begin_write_with_embedded_rowid`]; uploaded at
     /// commit.
     Files(Box<TableWriteSession>),
+    /// No new row versions: a `DELETE`.
+    None,
 }
 
 #[derive(Debug)]
@@ -1146,6 +1148,47 @@ impl DuckLakeTableWriter {
         data_file_path: &str,
         positions: &[i64],
     ) -> Result<DeleteFileInfo> {
+        self.write_delete_file_rows(schema_name, table_name, data_file_path, positions, None)
+            .await
+    }
+
+    /// [`Self::write_delete_file`] with a per-row deletion snapshot: the file
+    /// gets DuckLake's `_ducklake_internal_snapshot_id` column, so a reader at
+    /// a snapshot before a row's deletion snapshot does not apply it.
+    /// `snapshots` is aligned with `positions`.
+    pub(crate) async fn write_delete_file_with_snapshots(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        positions: &[i64],
+        snapshots: &[i64],
+    ) -> Result<DeleteFileInfo> {
+        if positions.len() != snapshots.len() {
+            return Err(crate::error::DuckLakeError::Internal(format!(
+                "{} delete positions but {} deletion snapshots",
+                positions.len(),
+                snapshots.len()
+            )));
+        }
+        self.write_delete_file_rows(
+            schema_name,
+            table_name,
+            data_file_path,
+            positions,
+            Some(snapshots),
+        )
+        .await
+    }
+
+    async fn write_delete_file_rows(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        positions: &[i64],
+        snapshots: Option<&[i64]>,
+    ) -> Result<DeleteFileInfo> {
         use arrow::array::{Int64Array, StringArray};
 
         let scoped_base = match self.metadata.catalog_id() {
@@ -1158,14 +1201,24 @@ impl DuckLakeTableWriter {
         // Strip leading slash for object_store Path (it expects relative keys).
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
-        let schema = delete_file_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
-                Arc::new(Int64Array::from(positions.to_vec())),
-            ],
-        )?;
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
+            Arc::new(Int64Array::from(positions.to_vec())),
+        ];
+        let schema = match snapshots {
+            None => delete_file_schema(),
+            Some(snapshots) => {
+                columns.push(Arc::new(Int64Array::from(snapshots.to_vec())));
+                let mut fields: Vec<arrow::datatypes::Field> = delete_file_schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect();
+                fields.push(embedded_snapshot_id_field());
+                Arc::new(Schema::new(fields))
+            },
+        };
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
 
         // Stream to a local staging file, then multipart-upload it — the same
         // bounded-memory path `finish()` uses for data files.
@@ -1821,6 +1874,8 @@ impl DuckLakeTableWriter {
                     inlined_deletes: Vec::new(),
                     inlined_flush: false,
                     inlined_row_ids: None,
+                    inlined_file_deletes: Vec::new(),
+                    inlined_delete_flushes: Vec::new(),
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
@@ -1909,6 +1964,8 @@ impl DuckLakeTableWriter {
                 inlined_deletes: Vec::new(),
                 inlined_flush: false,
                 inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                inlined_delete_flushes: Vec::new(),
             },
             object_paths,
             files_written,
@@ -1950,6 +2007,18 @@ impl DuckLakeTableWriter {
             && self.metadata.supports_data_inlining_values(batches)
     }
 
+    /// Whether the removal of `rows` Parquet rows goes to the catalog's
+    /// inlined-deletion table instead of delete files: the rows fit the
+    /// writer's `data_inlining_row_limit` and the metadata writer supports
+    /// deletion inlining.
+    pub(crate) fn should_inline_file_deletes(&self, rows: usize) -> bool {
+        rows > 0
+            && self
+                .data_inlining_row_limit
+                .is_some_and(|limit| rows <= limit)
+            && self.metadata.supports_inlined_file_deletes()
+    }
+
     /// Commit an `UPDATE` whose old or new row versions live in inlined storage,
     /// in ONE snapshot: the new row versions (`versions`), the positional deletes
     /// that end old versions held in Parquet files, and the inlined-row deletes
@@ -1978,6 +2047,7 @@ impl DuckLakeTableWriter {
         versions: UpdateVersions,
         positional_deletes: &[DeleteFileEntry],
         inlined_deletes: &[InlinedRowRef],
+        inlined_file_deletes: &[InlinedFileDeleteEntry],
     ) -> Result<WriteResult> {
         validate_delete_entries(WriteMode::Append, positional_deletes)?;
         let mut object_paths = positional_deletes
@@ -2013,6 +2083,24 @@ impl DuckLakeTableWriter {
                         Some(row_ids),
                         0,
                         rows,
+                    )
+                },
+                UpdateVersions::None => {
+                    let columns = arrow_schema_to_column_defs(arrow_schema)?;
+                    let setup = self.metadata.begin_write_transaction(
+                        schema_name,
+                        table_name,
+                        &columns,
+                        WriteMode::Append,
+                    )?;
+                    (
+                        setup.table_id,
+                        columns,
+                        setup.field_ids,
+                        StagedTableData::None,
+                        None,
+                        0,
+                        0,
                     )
                 },
                 UpdateVersions::Files(mut session) => {
@@ -2054,6 +2142,8 @@ impl DuckLakeTableWriter {
                 inlined_deletes: inlined_deletes.to_vec(),
                 inlined_flush: false,
                 inlined_row_ids: row_ids,
+                inlined_file_deletes: inlined_file_deletes.to_vec(),
+                inlined_delete_flushes: Vec::new(),
             },
             object_paths,
             files_written,
@@ -2064,6 +2154,68 @@ impl DuckLakeTableWriter {
             (Some(result), true) => Ok(result),
             _ => Err(crate::DuckLakeError::Internal(
                 "UPDATE commit returned an unexpected number of table results".to_string(),
+            )),
+        }
+    }
+
+    /// Commit a flush of inlined Parquet-row deletions in one snapshot through
+    /// [`MetadataWriter::commit_multi_table`], with `base_snapshot` (the
+    /// snapshot the flush read) as the stage's base. When the commit is
+    /// definitely rejected, the uploaded delete files are removed.
+    pub(crate) async fn commit_inlined_delete_flush(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        base_snapshot: i64,
+        flushes: Vec<InlinedDeleteFlushEntry>,
+    ) -> Result<WriteResult> {
+        let object_paths = flushes
+            .iter()
+            .map(|entry| {
+                self.staged_object_path(
+                    schema_name,
+                    table_name,
+                    &entry.delete.path,
+                    entry.delete.path_is_relative,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let setup = self.metadata.begin_write_transaction(
+            schema_name,
+            table_name,
+            &columns,
+            WriteMode::Append,
+        )?;
+        let mut transaction = self.transaction();
+        transaction.writes.push(PreparedTableWrite {
+            write: StagedTableWrite {
+                table_id: setup.table_id,
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+                base_snapshot_id: base_snapshot,
+                mode: WriteMode::Append,
+                columns,
+                column_ids: setup.field_ids,
+                data: StagedTableData::None,
+                snapshot_id_columns: Vec::new(),
+                positional_deletes: Vec::new(),
+                inlined_deletes: Vec::new(),
+                inlined_flush: false,
+                inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                inlined_delete_flushes: flushes,
+            },
+            object_paths,
+            files_written: 0,
+            records_written: 0,
+        });
+        let mut results = transaction.commit().await?;
+        match (results.pop(), results.is_empty()) {
+            (Some(result), true) => Ok(result),
+            _ => Err(crate::DuckLakeError::Internal(
+                "inlined delete flush returned an unexpected number of table results".to_string(),
             )),
         }
     }
@@ -2443,6 +2595,8 @@ impl DuckLakeWriteTransaction<'_> {
                 inlined_deletes: inlined_deletes.to_vec(),
                 inlined_flush: false,
                 inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                inlined_delete_flushes: Vec::new(),
             },
             object_paths,
             files_written: 0,
@@ -2461,11 +2615,18 @@ impl DuckLakeWriteTransaction<'_> {
             .iter()
             .map(|prepared| prepared.write.clone())
             .collect::<Vec<_>>();
-        let committed = self.writer.metadata.commit_multi_table(
-            &writes,
-            &self.commit_metadata,
-            self.expected_base_snapshot_id,
-        );
+        let committed = if self.writer.metadata.supports_inlined_file_deletes() {
+            Ok(())
+        } else {
+            crate::metadata_writer::reject_inlined_file_deletes(&writes)
+        }
+        .and_then(|()| {
+            self.writer.metadata.commit_multi_table(
+                &writes,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )
+        });
         let committed = match committed {
             Ok(committed) => committed,
             Err(e) => {

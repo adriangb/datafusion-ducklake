@@ -2682,8 +2682,38 @@ impl DuckLakeTable {
         state: &dyn Session,
         delete_file: &DuckLakeFileData,
     ) -> DataFusionResult<HashSet<i64>> {
-        // Get the standard delete file schema
-        let delete_schema = delete_file_schema();
+        // A cumulative delete file (written by a flush of inlined deletions)
+        // records each position's deletion snapshot; a position deleted after
+        // the snapshot this table reads is not deleted yet.
+        Ok(self
+            .read_delete_file_entries(state, delete_file)
+            .await?
+            .into_iter()
+            .filter(|(_, snapshot)| snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id))
+            .map(|(position, _)| position)
+            .collect())
+    }
+
+    /// Every `(pos, deletion snapshot)` of a delete file. The snapshot is the
+    /// file's `_ducklake_internal_snapshot_id` column, or `None` for a file
+    /// without one (all its positions are deleted from the file's
+    /// `begin_snapshot` on).
+    pub(crate) async fn read_delete_file_entries(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+    ) -> DataFusionResult<Vec<(i64, Option<i64>)>> {
+        // The standard delete file schema, plus the optional per-row snapshot
+        // column, which reads as NULL from a file that lacks it.
+        let delete_schema = {
+            let mut fields: Vec<Field> = delete_file_schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            fields.push(crate::row_id::embedded_snapshot_id_field());
+            Arc::new(Schema::new(fields))
+        };
 
         // Resolve the delete file path
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
@@ -2726,13 +2756,11 @@ impl DuckLakeTable {
             },
         };
 
-        // Extract all positions from all batches
-        let mut positions = HashSet::new();
+        let mut entries = Vec::new();
         for batch in batches {
-            extract_deleted_positions_from_batch(&batch, &mut positions)?;
+            extract_delete_entries_from_batch(&batch, &mut entries)?;
         }
-
-        Ok(positions)
+        Ok(entries)
     }
 
     pub(crate) fn inlined_deletes_by_file(&self) -> DataFusionResult<HashMap<i64, HashSet<i64>>> {
@@ -4177,14 +4205,16 @@ impl DuckLakeTable {
 
         let matched_count = new_positions.len();
         let mut cumulative = scan.existing_parquet_deleted.clone();
-        cumulative.extend(new_positions);
+        cumulative.extend(new_positions.iter().copied());
         let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
         cumulative_positions.sort_unstable();
+        new_positions.sort_unstable();
 
         Ok(FileUpdateOutput {
             updated_batches,
             matched_count,
             cumulative_positions,
+            new_positions,
         })
     }
 }
@@ -4511,6 +4541,9 @@ pub(crate) struct FileUpdateOutput {
     /// Physical positions to mask on the source file afterwards: the rows this
     /// update supersedes unioned with any already-deleted rows (sorted).
     pub(crate) cumulative_positions: Vec<i64>,
+    /// Only the positions of the rows this update supersedes (sorted): what an
+    /// inlined deletion records.
+    pub(crate) new_positions: Vec<i64>,
 }
 
 #[async_trait]
@@ -5104,21 +5137,18 @@ fn combine_execution_plans(
     }
 }
 
-/// Extract deleted row positions from a delete file RecordBatch
+/// Extract `(pos, deletion snapshot)` pairs from a delete file RecordBatch.
 ///
-/// Delete files have schema: (file_path: VARCHAR, pos: INT64)
-/// We only extract the "pos" column - the "file_path" column is metadata/documentation
-/// only (for Iceberg compatibility). The metadata catalog already tells us which delete
-/// file is associated with which data file.
-fn extract_deleted_positions_from_batch(
+/// Delete files have schema `(file_path: VARCHAR, pos: INT64)`, optionally
+/// with a per-row `_ducklake_internal_snapshot_id: INT64`. The `file_path`
+/// column is provenance only (for Iceberg compatibility): the metadata catalog
+/// already says which data file a delete file belongs to.
+fn extract_delete_entries_from_batch(
     batch: &RecordBatch,
-    positions: &mut HashSet<i64>,
+    entries: &mut Vec<(i64, Option<i64>)>,
 ) -> DataFusionResult<()> {
-    // Get the pos column index by name (not magic number)
     let schema = batch.schema();
     let pos_idx = schema.index_of(DELETE_POS_COL)?;
-
-    // Get the pos column
     let pos_array = batch
         .column(pos_idx)
         .as_any()
@@ -5126,11 +5156,25 @@ fn extract_deleted_positions_from_batch(
         .ok_or_else(|| {
             DataFusionError::Internal(format!("{} column not found or wrong type", DELETE_POS_COL))
         })?;
+    let snapshots = match schema.index_of(crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME) {
+        Ok(index) => Some(
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "delete file snapshot column has the wrong type".to_string(),
+                    )
+                })?,
+        ),
+        Err(_) => None,
+    };
 
-    // Extract all non-null positions
     for i in 0..batch.num_rows() {
         if !pos_array.is_null(i) {
-            positions.insert(pos_array.value(i));
+            let snapshot = snapshots.and_then(|column| column.is_valid(i).then(|| column.value(i)));
+            entries.push((pos_array.value(i), snapshot));
         }
     }
 
